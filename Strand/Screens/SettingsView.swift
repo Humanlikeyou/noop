@@ -268,10 +268,14 @@ struct SettingsView: View {
                 #if os(iOS)
                 liveNotificationsCard.staggeredAppear(index: 3)
                 #endif
-                streakCard.staggeredAppear(index: 4)
-                featuresCard.staggeredAppear(index: 5)
+                LucidDreamSettingsCard(settings: model.lucidDreamSettings,
+                                       controller: model.lucidDreamController,
+                                       live: live)
+                    .staggeredAppear(index: 4)
+                streakCard.staggeredAppear(index: 5)
+                featuresCard.staggeredAppear(index: 6)
                 #if os(iOS)
-                syncCard.staggeredAppear(index: 6)
+                syncCard.staggeredAppear(index: 7)
                 #endif
 
                 // Lower-frequency sections collapse behind a single default-closed disclosure so the
@@ -289,10 +293,10 @@ struct SettingsView: View {
                     experimentalCard
                     backupCard
                 }
-                .staggeredAppear(index: 6)
+                .staggeredAppear(index: 8)
 
                 // About stays expanded at the foot (version, links and the help sheets people return to).
-                aboutCard.staggeredAppear(index: 7)
+                aboutCard.staggeredAppear(index: 9)
             }
         }
         .alert(backupAlertTitle, isPresented: $showBackupAlert) {
@@ -2865,6 +2869,135 @@ private struct SettingsSection<Content: View>: View {
         }
     }
 }
+
+// MARK: - Lucid Dream Mode
+
+/// The requested additive Settings card. It uses the same SettingsSection/FormRow components and leaves
+/// the rest of Settings untouched. The test button is the only awake/manual haptic entry point.
+private struct LucidDreamSettingsCard: View {
+    @ObservedObject var settings: LucidDreamSettingsStore
+    @ObservedObject var controller: LucidDreamController
+    @ObservedObject var live: LiveState
+
+    var body: some View {
+        SettingsSection(
+            icon: "moon.stars.fill",
+            title: "Lucid Dream Mode",
+            blurb: "Optionally sends a subtle wrist cue only after NOOP sees sustained likely REM later in your sleep. It stays conservative when data is missing or delayed."
+        ) {
+            VStack(alignment: .leading, spacing: 0) {
+                FormRow(label: "Enable Lucid Dream Mode") {
+                    Toggle("Enable Lucid Dream Mode", isOn: $settings.enabled)
+                        .labelsHidden()
+                        .toggleStyle(.switch)
+                        .tint(StrandPalette.accent)
+                }
+
+                if settings.enabled {
+                    divider
+                    stepperRow(label: "Start monitoring after sleep onset",
+                               value: $settings.monitoringDelayMinutes,
+                               range: 60...600, step: 15,
+                               display: Self.hoursMinutes(settings.monitoringDelayMinutes))
+                    divider
+                    stepperRow(label: "Stable REM required before cue",
+                               value: $settings.stableREMMinutes,
+                               range: 1...20, step: 1,
+                               display: "\(settings.stableREMMinutes) min")
+                    divider
+                    stepperRow(label: "Maximum cues per REM episode",
+                               value: $settings.maxCuesPerEpisode,
+                               range: 1...4, step: 1,
+                               display: "\(settings.maxCuesPerEpisode)")
+                    divider
+                    stepperRow(label: "Delay between cues",
+                               value: $settings.cueDelaySeconds,
+                               range: 30...300, step: 30,
+                               display: "\(settings.cueDelaySeconds) sec")
+                    divider
+                    FormRow(label: "Stop cues if awakening or significant movement is detected") {
+                        Toggle("Stop cues if awakening or significant movement is detected",
+                               isOn: $settings.stopOnArousal)
+                            .labelsHidden()
+                            .toggleStyle(.switch)
+                            .tint(StrandPalette.accent)
+                    }
+                    divider
+                    FormRow(label: "Logging") {
+                        Toggle("Logging", isOn: $settings.loggingEnabled)
+                            .labelsHidden()
+                            .toggleStyle(.switch)
+                            .tint(StrandPalette.accent)
+                    }
+                    divider
+                    HStack(spacing: 12) {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("Lucid cue test")
+                                .font(StrandFont.body)
+                                .foregroundStyle(StrandPalette.textPrimary)
+                            Text("Uses the exact subtle cue used during sleep.")
+                                .font(StrandFont.caption)
+                                .foregroundStyle(StrandPalette.textTertiary)
+                        }
+                        Spacer(minLength: 12)
+                        Button {
+                            controller.testCue()
+                        } label: {
+                            Label("Test cue", systemImage: "waveform.path")
+                        }
+                        .buttonStyle(.bordered)
+                        .tint(StrandPalette.accent)
+                        .disabled(!live.connected || !live.encryptedBond)
+                    }
+                    .padding(.vertical, 5)
+
+                    divider
+                    HStack(alignment: .top, spacing: 9) {
+                        Image(systemName: controller.state == .aroused
+                              ? "exclamationmark.shield.fill" : "waveform.path.ecg")
+                            .foregroundStyle(controller.state == .aroused
+                                             ? StrandPalette.statusWarning : StrandPalette.accent)
+                            .accessibilityHidden(true)
+                        Text(controller.statusText)
+                            .font(StrandFont.caption)
+                            .foregroundStyle(StrandPalette.textSecondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .padding(.top, 8)
+                }
+            }
+        }
+    }
+
+    private var divider: some View {
+        Rectangle()
+            .fill(StrandPalette.hairline)
+            .frame(height: 1)
+            .padding(.vertical, 4)
+    }
+
+    private func stepperRow(label: LocalizedStringKey, value: Binding<Int>,
+                            range: ClosedRange<Int>, step: Int, display: String) -> some View {
+        FormRow(label: label) {
+            HStack(spacing: 10) {
+                Text(display)
+                    .font(StrandFont.bodyNumber)
+                    .foregroundStyle(StrandPalette.textPrimary)
+                    .frame(minWidth: 58, alignment: .trailing)
+                Stepper(label, value: value, in: range, step: step)
+                    .labelsHidden()
+                    .accessibilityLabel(label)
+            }
+        }
+    }
+
+    private static func hoursMinutes(_ minutes: Int) -> String {
+        let hours = minutes / 60
+        let remainder = minutes % 60
+        return remainder == 0 ? "\(hours) hr" : "\(hours) hr \(remainder) min"
+    }
+}
+
 
 // MARK: - iOS diagnostics sheet
 

@@ -5526,6 +5526,23 @@ public final class BLEManager: NSObject, ObservableObject {
         log("Buzz: one-shot fired (patternId=2 loops=3 + runAlarm, acked)")
     }
 
+    /// Submit the subtle, single-loop cue used by Lucid Dream Mode. This reuses the existing verified,
+    /// generation-aware haptic path: WHOOP 4 receives preset 2 with one loop, while send() maps WHOOP
+    /// 5/MG to its Maverick notification body. It deliberately does not invoke RUN_ALARM.
+    func sendLucidDreamCue() -> String? {
+        guard state.connected, state.encryptedBond,
+              let peripheral, peripheral.state == .connected,
+              cmdCharacteristic != nil else {
+            log("Lucid Mode: haptic withheld - secure command channel unavailable")
+            return nil
+        }
+        send(.runHapticsPattern, payload: [2, 1, 0, 0, 0], writeType: .withResponse)
+        let pattern = selectedModel.deviceFamily == .whoop5
+            ? "whoop5-maverick-notify-one-loop" : "whoop4-preset-2-one-loop"
+        log("Lucid Mode: subtle haptic submitted (\(pattern))")
+        return pattern
+    }
+
     /// Haptic Clock (#460): buzz the current wall-clock time out on the strap so the user can read it
     /// off their wrist without a screen. The pure, unit-tested `HapticClock` encoder turns now into an
     /// ordered pulse list (long = a "ten", short = a "unit", in HH-tens / HH-units / MM-tens / MM-units

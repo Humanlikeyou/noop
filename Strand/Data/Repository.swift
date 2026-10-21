@@ -1393,6 +1393,22 @@ final class Repository: ObservableObject {
             .sorted { $0.startTs < $1.startTs }
     }
 
+    /// The newest on-device sleep-stage result and its measured movement epochs. Imported sessions are
+    /// excluded because they can be historical and do not guarantee matching current movement. Missing
+    /// motion remains missing so the Lucid Dream controller fails closed.
+    func latestLucidDreamSleepSnapshot(since: Int, now: Int)
+        async -> (session: CachedSleepSession, motion: [Double])? {
+        let sessions = await computedSleepSessions(from: since, to: now, limit: 64)
+            .filter { $0.effectiveStartTs <= now && $0.startTs <= now }
+        guard let latest = sessions.max(by: {
+            if $0.endTs != $1.endTs { return $0.endTs < $1.endTs }
+            return $0.startTs < $1.startTs
+        }) else { return nil }
+        let motions = await sessionMotions(sessions: [latest])
+        guard let motion = motions[latest.startTs], !motion.isEmpty else { return nil }
+        return (latest, motion)
+    }
+
     /// Every sleep BLOCK across BOTH sources, UN-deduplicated , so a split-sleep day (a nap
     /// + a main sleep, or any night recorded as multiple blocks) keeps ALL of its blocks.
     /// `sleeps` collapses each day to a single winner for the dashboard; this does not.

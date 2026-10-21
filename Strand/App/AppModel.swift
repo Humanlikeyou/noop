@@ -62,6 +62,9 @@ final class AppModel: ObservableObject {
     let profile = ProfileStore()
     /// Behaviour settings: double-tap action, wear automation, zone coaching, smart alarm, illness watch.
     let behavior = BehaviorStore()
+    /// Optional, default-off lucid-dream cue settings and runtime coordinator.
+    let lucidDreamSettings: LucidDreamSettingsStore
+    let lucidDreamController: LucidDreamController
     /// On-device WHOOP-style recovery/strain/sleep computation from raw strap streams.
     let intelligence: IntelligenceEngine
 
@@ -248,15 +251,22 @@ final class AppModel: ObservableObject {
 
     init() {
         let live = LiveState()
+        let ble = BLEManager(state: live, deviceId: deviceId)
+        let repo = Repository(deviceId: deviceId)
+        let lucidSettings = LucidDreamSettingsStore()
         self.live = live
         // SEED every subsystem with the same id (`deviceId`, "my-whoop" at launch). The store/registry
         // aren't open yet here, so the registry's active id can't be read synchronously; `bootstrapStore`
         // (write side) and `wireSourceCoordinator → adoptActiveDevice` (read spine, #814) re-point them to
         // the registry active id once the store opens. Single-device install keeps "my-whoop" throughout.
-        self.ble = BLEManager(state: live, deviceId: deviceId)
-        self.repo = Repository(deviceId: deviceId)
+        self.ble = ble
+        self.repo = repo
+        self.lucidDreamSettings = lucidSettings
+        self.lucidDreamController = LucidDreamController(settings: lucidSettings, live: live,
+                                                         repo: repo, haptics: ble)
         self.coach = AICoachEngine(repo: repo)
         self.intelligence = IntelligenceEngine(repo: repo, profile: profile, deviceId: deviceId)
+        self.lucidDreamController.start()
         // Route the engine's per-day scoring diagnostic into the SAME shareable strap log every other
         // subsystem writes to (PII-scrubbed by `live.append(log:)`), so a bug report ships proof of what
         // was computed per day. `live` is captured strongly (created just above) , the engine outlives the
@@ -533,6 +543,7 @@ final class AppModel: ObservableObject {
                 // v5: recompute the skin-temp suite snapshots (cycle phase + body clock) from the
                 // freshly-scored history so the Health hub cards read a ready result.
                 await self.refreshV5Signals()
+                await self.lucidDreamController.refreshEvidence()
                 // #836 battery: 30-min BACKSTOP cadence (twin of Android ANALYZE_INTERVAL_MS). The
                 // `force: false` gate above can't skip while the strap streams live HR — the fingerprint
                 // advances every second — so this re-scored the whole 21-day window every 15 min even though
@@ -768,6 +779,7 @@ final class AppModel: ObservableObject {
             await intelligence.analyzeRecent(skipIfUnchanged: true)
         }
         await refreshV5Signals()
+        await lucidDreamController.refreshEvidence()
         #if os(iOS)
         // #980: a strap backfill routinely completes while the app is BACKGROUNDED (it runs as a
         // bluetooth-central, so it stays alive to receive the offload). The only other widget-publish

@@ -23,6 +23,8 @@ public struct LucidDreamConfig: Equatable, Sendable {
     public var cueDelaySeconds: Int
     public var stopOnArousal: Bool
     /// The historical stream arrives on NOOP's normal sync cadence. Older evidence is unsafe to act on.
+    /// 8 minutes (was 20): with `LucidDreamRefreshPolicy` syncing every 5 minutes in the REM-watch
+    /// window, older evidence means the cue would likely land after the REM period has ended.
     public var maxEvidenceAgeSeconds: Int
     /// A real non-REM gap is required before a later REM classification counts as a new episode.
     public var newEpisodeGapSeconds: Int
@@ -33,7 +35,7 @@ public struct LucidDreamConfig: Equatable, Sendable {
                 maxCuesPerEpisode: Int = 2,
                 cueDelaySeconds: Int = 60,
                 stopOnArousal: Bool = true,
-                maxEvidenceAgeSeconds: Int = 20 * 60,
+                maxEvidenceAgeSeconds: Int = 8 * 60,
                 newEpisodeGapSeconds: Int = 2 * 60) {
         self.enabled = enabled
         self.monitoringDelaySeconds = monitoringDelaySeconds

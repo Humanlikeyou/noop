@@ -5,9 +5,7 @@ import WhoopStore
 import StrandAnalytics
 import StrandImport
 import OuraProtocol
-#if os(iOS)
 import UserNotifications
-#endif
 
 /// Data source currently running an import from the Data Sources screen.
 enum DataSourceImportKind {
@@ -263,9 +261,13 @@ final class AppModel: ObservableObject {
         self.repo = repo
         self.lucidDreamSettings = lucidSettings
         self.lucidDreamController = LucidDreamController(settings: lucidSettings, live: live,
-                                                         repo: repo, haptics: ble)
+                                                         repo: repo, haptics: ble,
+                                                         notifier: StrapBuzzNotifier(),
+                                                         keepAwake: SystemKeepAwake(),
+                                                         journal: LucidDreamJournal())
         self.coach = AICoachEngine(repo: repo)
         self.intelligence = IntelligenceEngine(repo: repo, profile: profile, deviceId: deviceId)
+        self.lucidDreamController.requestSync = { [weak ble = self.ble] in ble?.requestLucidDreamSync() }
         self.lucidDreamController.start()
         // Route the engine's per-day scoring diagnostic into the SAME shareable strap log every other
         // subsystem writes to (PII-scrubbed by `live.append(log:)`), so a bug report ships proof of what
@@ -1505,26 +1507,21 @@ final class AppModel: ObservableObject {
 
     /// Post the local notification mirroring the inactivity (sedentary) wrist nudge. Called right after
     /// `BLEManager.maybeBuzzInactivity` fires its buzz (see crossLaneNotes). `minutes` = the seated bout
-    /// length the detector reported. No-op on macOS and when wrist alerts are off.
+    /// length the detector reported. No-op when wrist alerts are off. Lucid fork: also posts on macOS.
     static func postInactivity(minutes: Int) {
-        #if os(iOS)
         let body = minutes > 0
             ? String(localized: "You've been seated for about \(minutes) min. Time to move.")
             : String(localized: "Time to move. You've been seated a while.")
         postWristAlert(identifier: "inactivity-nudge", title: String(localized: "Move reminder"), body: body)
-        #endif
     }
 
     /// Post the local notification mirroring the smart-alarm wake buzz. Called from the
-    /// `onSmartAlarmFired` hook. No-op on macOS and when wrist alerts are off.
+    /// `onSmartAlarmFired` hook. No-op when wrist alerts are off. Lucid fork: also posts on macOS.
     static func postSmartAlarm() {
-        #if os(iOS)
         postWristAlert(identifier: "smart-alarm-wake", title: String(localized: "Smart alarm"),
                        body: String(localized: "Good morning. Your smart alarm just woke you."))
-        #endif
     }
 
-    #if os(iOS)
     /// Shared post path: gate on the wrist-alerts master, then deliver only if the OS already authorized
     /// notifications (no second system prompt , BatteryNotifier-style status-only check). A fresh
     /// identifier per category means a new alert replaces the old one rather than stacking.
@@ -1540,7 +1537,6 @@ final class AppModel: ObservableObject {
             center.add(UNNotificationRequest(identifier: identifier, content: content, trigger: nil))
         }
     }
-    #endif
 
     /// Stable identifier base for the smart-alarm BACKUP wake notification(s). The every-day case uses
     /// this id directly; the per-weekday case fans out to "<base>-d<weekday>" so a re-arm replaces by id

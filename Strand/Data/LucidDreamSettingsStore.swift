@@ -12,6 +12,12 @@ final class LucidDreamSettingsStore: ObservableObject {
     @Published var cueDelaySeconds: Int { didSet { defaults.set(cueDelaySeconds, forKey: Key.cueDelay) } }
     @Published var stopOnArousal: Bool { didSet { defaults.set(stopOnArousal, forKey: Key.stopOnArousal) } }
     @Published var loggingEnabled: Bool { didSet { defaults.set(loggingEnabled, forKey: Key.logging) } }
+    /// Post a Mac notification explaining every Lucid cue the band is told to vibrate. Default on.
+    @Published var notifyOnCue: Bool { didSet { defaults.set(notifyOnCue, forKey: Key.notifyOnCue) } }
+    /// Hold a prevent-idle-sleep assertion overnight so the strap link survives. Default on.
+    @Published var keepMacAwake: Bool { didSet { defaults.set(keepMacAwake, forKey: Key.keepMacAwake) } }
+    /// Length of the pre-sleep cue-association practice.
+    @Published var trainingMinutes: Int { didSet { defaults.set(trainingMinutes, forKey: Key.trainingMinutes) } }
 
     private let defaults: UserDefaults
 
@@ -23,6 +29,9 @@ final class LucidDreamSettingsStore: ObservableObject {
         static let cueDelay = "lucidDream.cueDelaySeconds"
         static let stopOnArousal = "lucidDream.stopOnArousal"
         static let logging = "lucidDream.loggingEnabled"
+        static let notifyOnCue = "lucidDream.notifyOnCue"
+        static let keepMacAwake = "lucidDream.keepMacAwake"
+        static let trainingMinutes = "lucidDream.trainingMinutes"
     }
 
     init(defaults: UserDefaults = .standard) {
@@ -38,6 +47,11 @@ final class LucidDreamSettingsStore: ObservableObject {
                                      to: 30...300)
         stopOnArousal = defaults.object(forKey: Key.stopOnArousal) as? Bool ?? true
         loggingEnabled = defaults.object(forKey: Key.logging) as? Bool ?? true
+        notifyOnCue = defaults.object(forKey: Key.notifyOnCue) as? Bool ?? true
+        keepMacAwake = defaults.object(forKey: Key.keepMacAwake) as? Bool ?? true
+        trainingMinutes = Self.clamp(defaults.object(forKey: Key.trainingMinutes) as? Int
+                                         ?? LucidDreamTrainingPlan.defaultMinutes,
+                                     to: LucidDreamTrainingPlan.minutesRange)
     }
 
     var detectorConfig: LucidDreamConfig {

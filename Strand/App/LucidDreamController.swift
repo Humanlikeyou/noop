@@ -18,6 +18,18 @@ final class LucidDreamController: ObservableObject {
     @Published private(set) var state: LucidDreamState = .disabled
     @Published private(set) var statusText = "Lucid Mode: off"
     @Published private(set) var lastCueAt: Date?
+    /// Pre-sleep cue-association practice (`LucidDreamTrainingPlan`).
+    @Published private(set) var trainingRound = 0
+    @Published private(set) var trainingTotal = 0
+    @Published private(set) var trainingPrompt: String?
+    var trainingActive: Bool { trainingTimer != nil }
+    /// The night awaiting its morning check-in, and the running personal results.
+    @Published private(set) var pendingCheckIn: LucidNightRecord?
+    @Published private(set) var tally = LucidJournalTally([])
+    @Published private(set) var keepAwakeHeld = false
+
+    /// Asks the strap for a fresh history offload; wired by AppModel to `BLEManager.requestLucidDreamSync`.
+    var requestSync: (() -> Void)?
 
     private struct Evidence {
         let sessionID: String
@@ -44,15 +56,30 @@ final class LucidDreamController: ObservableObject {
     private var stageBeforeCue: String?
     private var cueSessionID: String?
     private var lastPostCueEvidenceLoggedAt: Int?
+    private let notifier: (any LucidDreamNotifying)?
+    private let keepAwake: (any LucidDreamKeepAwake)?
+    private let journal: LucidDreamJournal?
+    private var lastSyncRequestAt: Int?
+    private var lastLoggedArousalReason: String?
+    private var trainingTimer: AnyCancellable?
+    private var lastTouchAt: Int?
+    private var lastTouchMonitored = false
 
     init(settings: LucidDreamSettingsStore, live: LiveState, repo: Repository,
          haptics: any LucidDreamHapticSending,
-         eventLog: LucidDreamEventLog = LucidDreamEventLog()) {
+         eventLog: LucidDreamEventLog = LucidDreamEventLog(),
+         notifier: (any LucidDreamNotifying)? = nil,
+         keepAwake: (any LucidDreamKeepAwake)? = nil,
+         journal: LucidDreamJournal? = nil) {
         self.settings = settings
         self.live = live
         self.repo = repo
         self.haptics = haptics
         self.eventLog = eventLog
+        self.notifier = notifier
+        self.keepAwake = keepAwake
+        self.journal = journal
+        refreshCheckIn(now: Self.now())
     }
 
     func start() {
@@ -83,6 +110,10 @@ final class LucidDreamController: ObservableObject {
             publisher.sink { [weak self] _ in self?.resetAfterPolicyChange() }
                 .store(in: &cancellables)
         }
+
+        settings.$keepMacAwake.dropFirst().removeDuplicates().sink { [weak self] _ in
+            DispatchQueue.main.async { [weak self] in self?.updateKeepAwake(now: Self.now()) }
+        }.store(in: &cancellables)
 
         if settings.enabled {
             state = .waitingForSleep
@@ -150,6 +181,9 @@ final class LucidDreamController: ObservableObject {
         statusText = "Test cue sent"
         record(event: "manual_test_sent", now: now, vibrationTimestamp: now,
                selectedHapticPattern: pattern)
+        notify(identifier: "lucid-test-cue", title: "Lucid test cue sent to your band",
+               body: "You pressed Test cue in Settings. This is the same subtle buzz used during REM sleep.",
+               passive: false)
     }
 
     var logFileURL: URL { eventLog.fileURL }
@@ -178,7 +212,11 @@ final class LucidDreamController: ObservableObject {
         let oldState = previousState
         let changed = result.state != oldState
         previousState = result.state
-        if changed || result.probableArousal {
+        // A probable arousal holds for minutes and is re-evaluated on every HR tick; log it once per
+        // reason rather than per tick (6,886 identical lines over two real nights).
+        let arousalIsNew = result.probableArousal && result.stopReason != lastLoggedArousalReason
+        lastLoggedArousalReason = result.probableArousal ? result.stopReason : nil
+        if changed || arousalIsNew {
             let wasInREM = [.possibleREM, .stableREM, .cueSent, .observingResponse,
                             .cooldown, .aroused].contains(oldState)
             let remEnded = result.state == .monitoring && wasInREM
@@ -196,6 +234,8 @@ final class LucidDreamController: ObservableObject {
             record(event: "post_cue_observation", now: now)
             lastPostCueEvidenceLoggedAt = cueAt
         }
+
+        applySideEffects(now: now)
 
         guard result.shouldCue, let cueNumber = result.cueNumber else { return }
         guard let pattern = haptics.sendLucidDreamCue() else {
@@ -217,6 +257,133 @@ final class LucidDreamController: ObservableObject {
         record(event: "cue_sent", now: now, vibrationTimestamp: now,
                cueNumber: cueNumber, selectedHapticPattern: pattern,
                stopReason: cueNumber >= settings.maxCuesPerEpisode ? "maximum cues reached" : nil)
+        if let sessionID = evidence?.sessionID { journal?.recordCue(sessionID: sessionID, at: now) }
+        notifyCue(cueNumber: cueNumber, now: now)
+    }
+
+    // MARK: - Side effects (keep-awake, fresh syncs, night record)
+
+    private func applySideEffects(now: Int) {
+        updateKeepAwake(now: now)
+        if LucidDreamRefreshPolicy.shouldRequestSync(state: state, lastRequestAt: lastSyncRequestAt, now: now,
+                                                     sleepingNow: sleepingNow(now: now)),
+           live.connected, let requestSync {
+            lastSyncRequestAt = now
+            requestSync()
+        }
+        let monitored = LucidDreamRefreshPolicy.watchStates.contains(state)
+        if let evidence, let journal,
+           monitored != lastTouchMonitored || lastTouchAt.map({ now - $0 >= 60 }) ?? true {
+            lastTouchAt = now
+            lastTouchMonitored = monitored
+            journal.touch(sessionID: evidence.sessionID, sleepOnset: evidence.sleepOnset,
+                          monitored: monitored, now: now)
+        }
+    }
+
+    private func localHour(_ now: Int) -> Int {
+        Calendar.current.component(.hour, from: Date(timeIntervalSince1970: TimeInterval(now)))
+    }
+
+    /// Night window or fresh stage evidence: the shared "is this person plausibly asleep now" gate.
+    private func sleepingNow(now: Int) -> Bool {
+        LucidDreamKeepAwakePolicy.shouldHold(enabled: true, keepAwake: true, state: state,
+                                             localHour: localHour(now),
+                                             evidenceAgeSeconds: evidence.map { now - $0.stageObservedAt })
+    }
+
+    private func updateKeepAwake(now: Int) {
+        guard let keepAwake else { return }
+        keepAwake.setHeld(settings.enabled && settings.keepMacAwake && sleepingNow(now: now))
+        if keepAwakeHeld != keepAwake.isHeld { keepAwakeHeld = keepAwake.isHeld }
+    }
+
+    // MARK: - Notifications
+
+    private func notify(identifier: String, title: String, body: String, passive: Bool) {
+        guard settings.notifyOnCue, let notifier else { return }
+        notifier.post(identifier: identifier, title: title, body: body, passive: passive)
+    }
+
+    private func notifyCue(cueNumber: Int, now: Int) {
+        let clock = DateFormatter()
+        clock.dateFormat = "HH:mm"
+        let remStart = detector.suspectedREMAt
+        let body = LucidDreamCueExplanation.body(
+            remSinceClock: remStart.map { clock.string(from: Date(timeIntervalSince1970: TimeInterval($0))) },
+            remMinutes: remStart.map { max(0, now - $0) / 60 },
+            sinceOnsetMinutes: evidence.map { max(0, now - $0.sleepOnset) / 60 },
+            heartRate: detector.heartRateBeforeCue,
+            cueNumber: cueNumber,
+            cueDelaySeconds: settings.cueDelaySeconds)
+        // Overnight: passive (silent, no banner) so the notice cannot wake you; it is waiting in
+        // Notification Center in the morning. One id per cue so the night's history is kept.
+        notify(identifier: "lucid-cue-\(now)",
+               title: LucidDreamCueExplanation.title(cueNumber: cueNumber, maxCues: settings.maxCuesPerEpisode),
+               body: body, passive: true)
+    }
+
+    // MARK: - Pre-sleep training
+
+    /// Start the cue-association practice: one cue per round, each paired with a lucidity prompt.
+    func startTraining() {
+        guard trainingTimer == nil else { return }
+        guard live.connected, live.encryptedBond else {
+            statusText = "Training unavailable: connect and securely pair your WHOOP"
+            return
+        }
+        trainingTotal = LucidDreamTrainingPlan.rounds(minutes: settings.trainingMinutes)
+        trainingRound = 0
+        record(event: "training_started", now: Self.now())
+        trainingTimer = Timer.publish(every: TimeInterval(LucidDreamTrainingPlan.roundSeconds),
+                                      on: .main, in: .common).autoconnect()
+            .sink { [weak self] _ in self?.trainingTick() }
+        trainingTick()
+    }
+
+    func stopTraining(completed: Bool = false) {
+        guard trainingTimer != nil else { return }
+        trainingTimer = nil
+        trainingPrompt = completed ? LucidDreamTrainingPlan.closingPrompt : nil
+        record(event: completed ? "training_completed" : "training_stopped", now: Self.now())
+        objectWillChange.send()
+    }
+
+    private func trainingTick() {
+        guard trainingRound < trainingTotal else { stopTraining(completed: true); return }
+        let now = Self.now()
+        guard live.connected, live.encryptedBond, let pattern = haptics.sendLucidDreamCue() else {
+            statusText = "Training paused: strap link unavailable"
+            stopTraining()
+            return
+        }
+        trainingRound += 1
+        trainingPrompt = LucidDreamTrainingPlan.prompt(round: trainingRound)
+        record(event: "training_cue_sent", now: now, vibrationTimestamp: now,
+               cueNumber: trainingRound, selectedHapticPattern: pattern)
+        // One replacing notice for the whole session rather than one per round.
+        notify(identifier: "lucid-training",
+               title: "Lucid training cue \(trainingRound) of \(trainingTotal) sent to your band",
+               body: "Pre-sleep practice: \(trainingPrompt ?? "")", passive: false)
+    }
+
+    // MARK: - Morning check-in
+
+    func refreshCheckIn(now: Int) {
+        guard let journal else { return }
+        let pending = journal.pendingCheckIn(now: now)
+        if pending != pendingCheckIn { pendingCheckIn = pending }
+        let newTally = LucidJournalTally(journal.entries())
+        if newTally != tally { tally = newTally }
+    }
+
+    func submitCheckIn(lucid: Bool, wokeFromCue: Bool?, dreamRecalled: Bool) {
+        guard let journal, let night = pendingCheckIn else { return }
+        let now = Self.now()
+        journal.answer(night, lucid: lucid, wokeFromCue: wokeFromCue, dreamRecalled: dreamRecalled, now: now)
+        record(event: "check_in", now: now, cueNumber: night.cueTimes.count,
+               stopReason: "lucid=\(lucid) woke=\(wokeFromCue.map(String.init(describing:)) ?? "n/a") recalled=\(dreamRecalled)")
+        refreshCheckIn(now: now)
     }
 
     private func record(event: String, now: Int, vibrationTimestamp: Int? = nil,
@@ -290,7 +457,8 @@ final class LucidDreamController: ObservableObject {
         state = enabled ? .waitingForSleep : .disabled
         statusText = enabled ? "Lucid Mode: waiting for fresh sleep data" : "Lucid Mode: off"
         previousState = state
-        if enabled { activate() } else { deactivate() }
+        if enabled { activate() } else { deactivate(); stopTraining() }
+        updateKeepAwake(now: Self.now())
         record(event: enabled ? "enabled" : "disabled", now: Self.now())
     }
 
@@ -318,7 +486,11 @@ final class LucidDreamController: ObservableObject {
                 .store(in: &activeCancellables)
         }
         Timer.publish(every: 15, on: .main, in: .common).autoconnect()
-            .sink { [weak self] date in self?.evaluate(now: Int(date.timeIntervalSince1970)) }
+            .sink { [weak self] date in
+                let now = Int(date.timeIntervalSince1970)
+                self?.evaluate(now: now)
+                self?.refreshCheckIn(now: now)
+            }
             .store(in: &activeCancellables)
         Task { [weak self] in await self?.refreshEvidence() }
     }

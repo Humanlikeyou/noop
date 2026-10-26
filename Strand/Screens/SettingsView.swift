@@ -2930,6 +2930,34 @@ private struct LucidDreamSettingsCard: View {
                             .tint(StrandPalette.accent)
                     }
                     divider
+                    FormRow(label: "Notify on this Mac when the band vibrates") {
+                        Toggle("Notify on this Mac when the band vibrates", isOn: $settings.notifyOnCue)
+                            .labelsHidden()
+                            .toggleStyle(.switch)
+                            .tint(StrandPalette.accent)
+                    }
+                    caption("Each notice says why the cue fired. Overnight notices are silent and wait in Notification Center.")
+                    divider
+                    FormRow(label: "Keep Mac awake overnight") {
+                        Toggle("Keep Mac awake overnight", isOn: $settings.keepMacAwake)
+                            .labelsHidden()
+                            .toggleStyle(.switch)
+                            .tint(StrandPalette.accent)
+                    }
+                    caption(controller.keepAwakeHeld
+                            ? "Holding the Mac awake now. Keep the lid open and plug in power."
+                            : "Holds from 19:00 to 11:00 and during sleep. A sleeping Mac drops the strap link. Keep the lid open.")
+                    divider
+                    trainingBlock
+                    if let night = controller.pendingCheckIn {
+                        divider
+                        checkInBlock(night)
+                    }
+                    if controller.tally.nights > 0 {
+                        divider
+                        resultsBlock
+                    }
+                    divider
                     HStack(spacing: 12) {
                         VStack(alignment: .leading, spacing: 3) {
                             Text("Lucid cue test")
@@ -2974,6 +3002,135 @@ private struct LucidDreamSettingsCard: View {
             .fill(StrandPalette.hairline)
             .frame(height: 1)
             .padding(.vertical, 4)
+    }
+
+    private func caption(_ text: String) -> some View {
+        Text(text)
+            .font(StrandFont.caption)
+            .foregroundStyle(StrandPalette.textTertiary)
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(.bottom, 4)
+    }
+
+    // MARK: Pre-sleep training
+
+    private var trainingBlock: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 12) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Pre-sleep training")
+                        .font(StrandFont.body)
+                        .foregroundStyle(StrandPalette.textPrimary)
+                    Text("Do this in bed before sleep. The band buzzes once a minute; follow each prompt so the cue becomes your dream sign.")
+                        .font(StrandFont.caption)
+                        .foregroundStyle(StrandPalette.textTertiary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer(minLength: 12)
+                if controller.trainingActive {
+                    Button {
+                        controller.stopTraining()
+                    } label: {
+                        Label("Stop", systemImage: "stop.fill")
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(StrandPalette.statusWarning)
+                } else {
+                    Button {
+                        controller.startTraining()
+                    } label: {
+                        Label("Start", systemImage: "play.fill")
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(StrandPalette.accent)
+                    .disabled(!live.connected || !live.encryptedBond)
+                }
+            }
+            if !controller.trainingActive {
+                stepperRow(label: "Training length",
+                           value: $settings.trainingMinutes,
+                           range: LucidDreamTrainingPlan.minutesRange, step: 1,
+                           display: "\(settings.trainingMinutes) min")
+            }
+            if let prompt = controller.trainingPrompt {
+                VStack(alignment: .leading, spacing: 3) {
+                    if controller.trainingActive {
+                        Text("Cue \(controller.trainingRound) of \(controller.trainingTotal)")
+                            .font(StrandFont.caption)
+                            .foregroundStyle(StrandPalette.accent)
+                    }
+                    Text(prompt)
+                        .font(StrandFont.body)
+                        .foregroundStyle(StrandPalette.textPrimary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(.top, 2)
+            }
+        }
+        .padding(.vertical, 5)
+    }
+
+    // MARK: Morning check-in
+
+    @State private var answerLucid = false
+    @State private var answerWoke = false
+    @State private var answerRecalled = false
+
+    private func checkInBlock(_ night: LucidNightRecord) -> some View {
+        let cued = !night.cueTimes.isEmpty
+        let clock = DateFormatter()
+        clock.dateFormat = "HH:mm"
+        let cueText = cued
+            ? "\(night.cueTimes.count) cue\(night.cueTimes.count == 1 ? "" : "s") at "
+                + night.cueTimes.map { clock.string(from: Date(timeIntervalSince1970: TimeInterval($0))) }
+                    .joined(separator: ", ")
+            : "no cues (a comparison night)"
+        return VStack(alignment: .leading, spacing: 6) {
+            Text("Morning check-in")
+                .font(StrandFont.body)
+                .foregroundStyle(StrandPalette.textPrimary)
+            Text("Last night: \(cueText).")
+                .font(StrandFont.caption)
+                .foregroundStyle(StrandPalette.textTertiary)
+            Toggle("I had a lucid dream", isOn: $answerLucid)
+                .toggleStyle(.switch).tint(StrandPalette.accent)
+            if cued {
+                Toggle("A cue woke me up", isOn: $answerWoke)
+                    .toggleStyle(.switch).tint(StrandPalette.accent)
+            }
+            Toggle("I remember a dream", isOn: $answerRecalled)
+                .toggleStyle(.switch).tint(StrandPalette.accent)
+            HStack {
+                Spacer()
+                Button("Save check-in") {
+                    controller.submitCheckIn(lucid: answerLucid, wokeFromCue: cued ? answerWoke : nil,
+                                             dreamRecalled: answerRecalled)
+                    answerLucid = false; answerWoke = false; answerRecalled = false
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(StrandPalette.accent)
+            }
+        }
+        .font(StrandFont.body)
+        .foregroundStyle(StrandPalette.textPrimary)
+        .padding(.vertical, 5)
+    }
+
+    private var resultsBlock: some View {
+        let t = controller.tally
+        func pct(_ a: Int, _ b: Int) -> String { b == 0 ? "–" : "\(Int((Double(a) / Double(b) * 100).rounded()))%" }
+        return VStack(alignment: .leading, spacing: 3) {
+            Text("Your results (\(t.nights) night\(t.nights == 1 ? "" : "s"))")
+                .font(StrandFont.body)
+                .foregroundStyle(StrandPalette.textPrimary)
+            Text("Lucid on cued nights: \(t.lucidCued)/\(t.cuedNights) (\(pct(t.lucidCued, t.cuedNights))) · uncued: \(t.lucidUncued)/\(t.uncuedNights) (\(pct(t.lucidUncued, t.uncuedNights)))")
+                .font(StrandFont.caption)
+                .foregroundStyle(StrandPalette.textSecondary)
+            Text("Woken by a cue: \(t.wokeFromCue)/\(t.cuedNights) · dream recalled: \(t.recalled)/\(t.nights)")
+                .font(StrandFont.caption)
+                .foregroundStyle(StrandPalette.textSecondary)
+        }
+        .padding(.vertical, 5)
     }
 
     private func stepperRow(label: LocalizedStringKey, value: Binding<Int>,

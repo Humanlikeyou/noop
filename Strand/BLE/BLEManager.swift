@@ -5526,6 +5526,15 @@ public final class BLEManager: NSObject, ObservableObject {
         log("Buzz: one-shot fired (patternId=2 loops=3 + runAlarm, acked)")
     }
 
+    /// Lucid Dream Mode's REM-watch window asks for a fresh history offload every few minutes so cue
+    /// decisions act on stage evidence minutes old instead of up to half an hour. Routes through the
+    /// same gated `requestSync` as every other trigger, at the `.manual` tier so the 15-minute floor
+    /// does not swallow it; the connected + bonded + not-already-backfilling gate still applies.
+    func requestLucidDreamSync() {
+        log("Lucid Mode: requesting fresh history for REM evidence")
+        requestSync(.manual)
+    }
+
     /// Submit the subtle, single-loop cue used by Lucid Dream Mode. This reuses the existing verified,
     /// generation-aware haptic path: WHOOP 4 receives preset 2 with one loop, while send() maps WHOOP
     /// 5/MG to its Maverick notification body. It deliberately does not invoke RUN_ALARM.

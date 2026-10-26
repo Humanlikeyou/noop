@@ -24,12 +24,13 @@ func stressActivityMaskedHoursCaption(_ count: Int) -> String? {
 //      day has a stored stress value we trust it.
 //   2. Otherwise we DERIVE it from how today's resting HR / HRV sit against a
 //      personal 30-day baseline. Stress shows up as HIGHER resting HR and LOWER
-//      HRV, so we sum two z-scores and squash onto 0–3 with a logistic curve:
+//      HRV, so we average two z-scores and squash onto 0–3 with a logistic curve
+//      (each signal needs `StressMath.minBaselineDays` of history; σ is floored):
 //
-//        zRHR = (todayRHR − meanRHR) / sdRHR        // positive when RHR is UP
-//        zHRV = (meanHRV − todayHRV) / sdHRV        // positive when HRV is DOWN
-//        raw  = zRHR + zHRV                          // combined autonomic load
-//        stress = 3 / (1 + e^(−raw))                // 0 calm · 1.5 baseline · 3 high
+//        zRHR = (todayRHR − meanRHR) / sdRHR              // positive when RHR is UP
+//        zHRV = (mean lnHRV − ln todayHRV) / sd lnHRV     // positive when HRV is DOWN
+//        raw  = mean(zRHR, zHRV)                          // combined autonomic load
+//        stress = 3 / (1 + e^(−raw))                      // 0 calm · 1.5 baseline · 3 high
 //
 // Bands:  0–1 LOW · 1–2 MEDIUM · 2–3 HIGH.
 //
@@ -860,29 +861,15 @@ struct StressModel {
 
         // Baseline window: up to 30 days ending the day BEFORE the scored day, so it's measured
         // against its own recent past rather than itself.
-        let baseline = idx > 0 ? Array(days[0..<idx].suffix(30)) : []
-
-        let rhrBase = baseline.compactMap { $0.restingHr }.map(Double.init)
-        let hrvBase = baseline.compactMap { $0.avgHrv }
-
-        let meanRHR = StressMath.mean(rhrBase)
-        let sdRHR   = StressMath.std(rhrBase, mean: meanRHR)
-        let meanHRV = StressMath.mean(hrvBase)
-        let sdHRV   = StressMath.std(hrvBase, mean: meanHRV)
+        let base = StressMath.baseline(days, before: idx)
 
         let rhrT = today.restingHr.map(Double.init)
         let hrvT = today.avgHrv
 
         // Resolve today's score: prefer a stored value, else derive.
-        let derivedAvailable = (rhrT != nil && meanRHR != nil) || (hrvT != nil && meanHRV != nil)
+        let derivedToday = StressMath.score(rhrToday: rhrT, hrvToday: hrvT, baseline: base)
         let storedToday = storedByDay[today.day]
-        guard storedToday != nil || derivedAvailable else { return nil }
-
-        let derivedToday: Double? = derivedAvailable
-            ? StressMath.squash(StressMath.rawScore(
-                rhrToday: rhrT, meanRHR: meanRHR, sdRHR: sdRHR,
-                hrvToday: hrvT, meanHRV: meanHRV, sdHRV: sdHRV))
-            : nil
+        guard storedToday != nil || derivedToday != nil else { return nil }
 
         let s = storedToday ?? derivedToday ?? 1.5
         self.usingStored = storedToday != nil
@@ -890,8 +877,8 @@ struct StressModel {
         self.band = StressBand(score: s)
         self.rhrToday = today.restingHr
         self.hrvToday = hrvT
-        self.rhrDelta = (rhrT != nil && meanRHR != nil) ? (rhrT! - meanRHR!) : nil
-        self.hrvDelta = (hrvT != nil && meanHRV != nil) ? (hrvT! - meanHRV!) : nil
+        self.rhrDelta = (rhrT != nil && base.rhr != nil) ? (rhrT! - base.rhr!.mean) : nil
+        self.hrvDelta = (hrvT != nil && base.hrvMeanMs != nil) ? (hrvT! - base.hrvMeanMs!) : nil
 
         self.explanation = StressMath.explanation(
             band: self.band,
@@ -900,23 +887,19 @@ struct StressModel {
             usingStored: self.usingStored
         )
 
-        // Full daily proxy history: stored value if present for the day, else the
-        // z-score derivation against the SAME baseline so the line is comparable.
+        // Full daily proxy history: stored value if present for the day, else the derivation against
+        // THAT day's own trailing 30-day window, so a past day keeps the score it had at the time
+        // instead of being re-graded against today's baseline.
         var pts: [TrendPoint] = []
-        for d in days {
+        for (i, d) in days.enumerated() {
             guard let date = Self.dayParser.date(from: d.day) else { continue }
             if let v = storedByDay[d.day] {
                 pts.append(TrendPoint(date: date, value: v))
                 continue
             }
-            let dRHR = d.restingHr.map(Double.init)
-            let dHRV = d.avgHrv
-            guard (dRHR != nil && meanRHR != nil) || (dHRV != nil && meanHRV != nil) else { continue }
-            let r = StressMath.rawScore(
-                rhrToday: dRHR, meanRHR: meanRHR, sdRHR: sdRHR,
-                hrvToday: dHRV, meanHRV: meanHRV, sdHRV: sdHRV
-            )
-            pts.append(TrendPoint(date: date, value: StressMath.squash(r)))
+            guard let v = StressMath.score(rhrToday: d.restingHr.map(Double.init), hrvToday: d.avgHrv,
+                                           baseline: StressMath.baseline(days, before: i)) else { continue }
+            pts.append(TrendPoint(date: date, value: v))
         }
         self.fullTrend = pts
 
@@ -949,19 +932,58 @@ enum StressMath {
         return v.squareRoot()
     }
 
-    /// Combined autonomic z-score. RHR-up and HRV-down both push it positive.
-    static func rawScore(
-        rhrToday: Double?, meanRHR: Double?, sdRHR: Double,
-        hrvToday: Double?, meanHRV: Double?, sdHRV: Double
-    ) -> Double {
-        var sum = 0.0
-        if let r = rhrToday, let m = meanRHR, sdRHR > 0.0001 {
-            sum += (r - m) / sdRHR            // up = stress
+    // Lucid fork (2026-10-26), Refs #471. The previous score summed a raw-ms HRV z and an RHR z over a
+    // plain 30-day mean/SD with no minimum history and no σ floor. On a simulated steady person that
+    // read ~35% of days HIGH (~44% with 2 days of history), and a 1 bpm wobble on a tight baseline
+    // saturated the curve. Now: HRV is z-scored in the log domain (lnRMSSD, the HRV-literature
+    // convention), each signal needs `minBaselineDays`, each σ is floored from the same `Baselines`
+    // configs Charge uses, and the terms are AVERAGED so two signals don't double the swing.
+
+    /// Minimum prior days carrying a signal before that signal is scored against its baseline.
+    static let minBaselineDays = 7
+    /// σ floors, converted from the `Baselines` mean-absolute-deviation floors (σ ≈ 1.253 · MAD).
+    static let rhrSigmaFloor = 1.253 * Baselines.restingHRCfg.floorSpread
+    static let lnHRVSigmaFloor = 1.253 * Baselines.readinessHRVLnCfg.floorSpread
+
+    struct Signal { let mean: Double; let sd: Double }
+    struct DailyBaseline {
+        let rhr: Signal?
+        let lnHRV: Signal?
+        /// Plain-ms HRV mean, for the displayed "today vs baseline" delta only.
+        let hrvMeanMs: Double?
+    }
+
+    /// The trailing window (up to 30 days) BEFORE `index`, with each signal gated on
+    /// `minBaselineDays` and its σ floored.
+    static func baseline(_ days: [DailyMetric], before index: Int) -> DailyBaseline {
+        let window = index > 0 ? days[0..<index].suffix(30) : []
+        let rhrs = window.compactMap { $0.restingHr }.map(Double.init)
+        let hrvs = window.compactMap { $0.avgHrv }.filter { $0 > 0 }
+        func signal(_ xs: [Double], floor: Double) -> Signal? {
+            guard xs.count >= minBaselineDays, let m = mean(xs) else { return nil }
+            return Signal(mean: m, sd: max(std(xs, mean: m), floor))
         }
-        if let h = hrvToday, let m = meanHRV, sdHRV > 0.0001 {
-            sum += (m - h) / sdHRV            // down = stress
+        return DailyBaseline(rhr: signal(rhrs, floor: rhrSigmaFloor),
+                             lnHRV: signal(hrvs.map { log($0) }, floor: lnHRVSigmaFloor),
+                             hrvMeanMs: hrvs.count >= minBaselineDays ? mean(hrvs) : nil)
+    }
+
+    /// Mean of the available autonomic z-scores (RHR up and HRV down both push it positive), or nil
+    /// when neither signal has a usable baseline.
+    static func rawScore(rhrToday: Double?, hrvToday: Double?, baseline b: DailyBaseline) -> Double? {
+        var terms: [Double] = []
+        if let r = rhrToday, let s = b.rhr {
+            terms.append((r - s.mean) / s.sd)                // up = stress
         }
-        return sum
+        if let h = hrvToday, h > 0, let s = b.lnHRV {
+            terms.append((s.mean - log(h)) / s.sd)           // down = stress
+        }
+        return mean(terms)
+    }
+
+    /// The 0–3 daily score, or nil when nothing is scorable.
+    static func score(rhrToday: Double?, hrvToday: Double?, baseline: DailyBaseline) -> Double? {
+        rawScore(rhrToday: rhrToday, hrvToday: hrvToday, baseline: baseline).map(squash)
     }
 
     /// Logistic squash of the raw z-sum onto 0–3 (baseline 0 → 1.5).

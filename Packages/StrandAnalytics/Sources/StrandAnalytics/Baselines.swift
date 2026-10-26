@@ -233,7 +233,7 @@ public enum Baselines {
         //
         // VALIDATED (26-day Oura-reference correlation, HR-only, r≈0.6): the per-day value to
         // fold for "daytime_hr" is that day's 10th-percentile daytime HR (~65 bpm pooled across
-        // the reference set) — NOT the day-relative calmReference's 25th-percentile quartile.
+        // the reference set) — NOT the day-relative median-hour reference.
         // The "high stress" cutoff itself is a validated fixed bpm margin over this baseline,
         // NOT this config's floorSpread — see DaytimeStress.baselineRelativeHighMarginBPM.
         // TUNING SEAM: minVal/maxVal/half-life below (and all of "daytime_rmssd" — RMSSD wasn't

@@ -12,8 +12,8 @@ import WhoopProtocol
 //   • mean HR over the hour                    (HR up   = stress, like daily RHR)
 //   • RMSSD over the hour's clean R-R          (HRV down = stress, like daily avgHRV)
 //
-// and z-scores each against the day's OWN quiet reference (the calm-hour median + the
-// spread across hours), then squashes the z-sum onto 0–3 with the identical logistic
+// and scores each against the day's OWN typical hour (the median waking hour, with a fixed
+// bpm margin for HIGH, see `dayRelativeHighMarginBPM`), then squashes onto 0–3 with the identical logistic
 //   stress = 3 / (1 + e^(−raw)). 0 calm · 1.5 baseline · 3 high — same bands as the daily
 // score. The day is its own baseline: a desk day with one tense afternoon reads that
 // afternoon as elevated *relative to that person's own calm hours*, no cloud, no history
@@ -39,7 +39,7 @@ public enum DaytimeStress {
     /// The scored unit stays a full `bucketSeconds` hour. This only decides how often that hour is
     /// re-read, so a half-step gives two points an hour, each still an hour of data, rather than
     /// half-hours of thinner data. Shrinking `bucketSeconds` itself would have been a scoring change
-    /// wearing a display change's clothes: the calm reference is a quartile ACROSS buckets, the
+    /// wearing a display change's clothes: the day reference is a median ACROSS buckets, the
     /// post-exercise shadow looks back exactly one bucket, and `sustainedHours` counts them.
     ///
     /// Half rather than a quarter because adjacent points then share half their samples instead of
@@ -112,6 +112,18 @@ public enum DaytimeStress {
     /// only once daytime HR+RMSSD is validated to beat HR-only on an Oura-style stress reference.
     public static let daytimeRMSSDScoringEnabled: Bool = false
 
+    /// `.dayRelative`'s HIGH cutoff: an hour reads HIGH once its mean HR sits this many bpm above the
+    /// day's MEDIAN waking hour. Same fixed-margin model as `baselineRelativeHighMarginBPM`, translated
+    /// through `marginToSigma`, rather than scaling by the day's own across-hour SD.
+    /// WHY (Lucid fork, 2026-10-26): the previous reference was the day's calm QUARTILE with the
+    /// across-hour SD as the spread. On a simulated uneventful day (every hour from one distribution)
+    /// that read ~47% of hours HIGH HR-only and ~67% with RMSSD, and tripped the sustained-high Breathe
+    /// nudge on ~28% of days. The median centres a typical hour on 1.5 by construction, and a fixed
+    /// margin stops a flat day's tiny SD from inflating a 3 bpm wobble into HIGH. 10 bpm over the
+    /// median is chosen to sit near the validated 15 bpm over the 10th-percentile floor (the median
+    /// waking hour typically runs a few bpm above that floor). TUNING SEAM: not independently validated.
+    public static let dayRelativeHighMarginBPM: Double = 10.0
+
     // MARK: - Scoring mode
 
     /// WHERE each hour's "calm" reference point + spread come from. Every other step —
@@ -130,11 +142,10 @@ public enum DaytimeStress {
     /// ones would systematically over-read stress. The three surfaces are complementary lenses
     /// on the same underlying autonomic signal, not competing implementations of one baseline.
     public enum ScoringMode: Equatable, Sendable {
-        /// DEFAULT — unchanged from before this mode existed. Each hour is z-scored against
-        /// THIS DAY's own calm-hour reference (`calmReference`): the lower quartile of the
-        /// day's own waking-hour mean HR, the upper quartile of its own waking-hour RMSSD. No
-        /// personal history needed — the day is its own baseline. Byte-identical output to the
-        /// pre-existing single-mode `analyze` for the same hr/rr/tzOffsetSeconds.
+        /// DEFAULT. Each hour is scored against THIS DAY's own typical hour (`medianReference`
+        /// of the waking-hour mean HR) with the fixed `dayRelativeHighMarginBPM` margin. Daytime
+        /// RMSSD joins only when `daytimeRMSSDScoringEnabled`. No personal history needed — the
+        /// day is its own baseline.
         case dayRelative
 
         /// Oura-style — each hour is z-scored against the PERSONAL rolling baseline for daytime
@@ -474,11 +485,8 @@ public enum DaytimeStress {
         let hrOnlyFallback: Bool
         switch mode {
         case .dayRelative:
-            // The day's OWN quiet reference: centre on the CALM end (the lower quartile of
-            // hourly mean HR, the upper quartile of hourly RMSSD), and spread from the
-            // across-hour SD. This makes a flat day read ~baseline and a spiky day surface
-            // its tense hours — without any cross-day history. Falls back to the plain mean
-            // when there are too few scored hours for a quartile.
+            // The day's OWN reference: its median waking hour, so a flat day reads ~baseline and
+            // a spiky day surfaces its tense hours, without any cross-day history.
             //
             // Built from the WAKING hours only — the same hours scored in step 4. Sleep is the
             // calmest, lowest-HR / highest-HRV stretch of the day, and the analysis window
@@ -489,13 +497,21 @@ public enum DaytimeStress {
             // Ambulatory hours are excluded from the day's OWN calm reference too (the motion
             // gate): an exertion hour's elevated HR / suppressed HRV must not pull the calm
             // anchor up or inflate the across-hour spread the z-scores divide by.
+            // Centre on the day's MEDIAN waking hour with a fixed bpm margin for HIGH (see
+            // `dayRelativeHighMarginBPM`), and keep daytime RMSSD out of the score under the same gate
+            // `.baselineRelative` honours (`daytimeRMSSDScoringEnabled`).
             let referenceAggs = aggs.filter { isWakingHour($0.bucket) && !isAmbulatory($0.bucket) }
             let hrMeans = referenceAggs.compactMap { $0.meanHR }
-            let rmssdVals = referenceAggs.compactMap { $0.rmssd }
-            refHR = calmReference(hrMeans, calmIsLow: true)         // calm HR is LOW
-            refRMSSD = calmReference(rmssdVals, calmIsLow: false)   // calm HRV is HIGH
-            sdHR = std(hrMeans, mean: mean(hrMeans))
-            sdRMSSD = std(rmssdVals, mean: mean(rmssdVals))
+            refHR = medianReference(hrMeans)
+            sdHR = Self.marginToSigma(marginBPM: dayRelativeHighMarginBPM, atBand: highBandFloor)
+            if daytimeRMSSDScoringEnabled {
+                let rmssdVals = referenceAggs.compactMap { $0.rmssd }
+                refRMSSD = medianReference(rmssdVals)
+                sdRMSSD = std(rmssdVals, mean: mean(rmssdVals))
+            } else {
+                refRMSSD = nil
+                sdRMSSD = 0
+            }
             hrOnlyFallback = false
 
         case .baselineRelative(let hrBaseline, let rmssdBaseline):
@@ -633,14 +649,11 @@ public enum DaytimeStress {
         return hourOfDay >= wakingStartHour && hourOfDay < wakingEndHour
     }
 
-    /// The day's "calm" reference for a signal: the quartile toward the calm end (lower
-    /// quartile when calm is LOW, e.g. HR; upper quartile when calm is HIGH, e.g. RMSSD).
-    /// Falls back to the plain mean below 4 values, and to nil when empty.
-    static func calmReference(_ xs: [Double], calmIsLow: Bool) -> Double? {
+    /// The day's typical-hour reference for a signal: the median, or nil when empty. Replaces the
+    /// calm-quartile anchor for `.dayRelative` scoring (see `dayRelativeHighMarginBPM`).
+    static func medianReference(_ xs: [Double]) -> Double? {
         guard !xs.isEmpty else { return nil }
-        guard xs.count >= 4 else { return mean(xs) }
-        let s = xs.sorted()
-        return calmIsLow ? quantile(s, 0.25) : quantile(s, 0.75)
+        return quantile(xs.sorted(), 0.5)
     }
 
     /// Linear-interpolated quantile of an already-sorted, non-empty array.

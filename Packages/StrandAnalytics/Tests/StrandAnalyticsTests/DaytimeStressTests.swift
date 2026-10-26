@@ -98,14 +98,17 @@ final class DaytimeStressTests: XCTestCase {
             points.map { "\($0.startTs):" + ($0.level.map { String(format: "%.6f", $0) } ?? "nil") }
                 .joined(separator: " ")
         }
+        // Lucid fork (2026-10-26): `.dayRelative` now scores against the median hour with a fixed bpm
+        // margin and keeps daytime RMSSD gated off, so this gentle +4 bpm/hour morning ramp no longer
+        // reads as three hours of sustained HIGH. The Kotlin twin has NOT been updated in this fork.
         XCTAssertEqual(render(res.hours),
-                       "25200:0.990715 28800:1.500000 32400:2.009285 36000:2.413289 39600:2.678875")
+                       "25200:1.094451 28800:1.293378 32400:1.500000 36000:1.706622 39600:1.905549")
         XCTAssertEqual(render(res.timeline),
-                       "23400:0.990715 25200:0.990715 27000:1.500000 28800:1.500000 30600:2.009285 "
-                       + "32400:2.009285 34200:2.413289 36000:2.413289 37800:2.678875 39600:2.678875")
-        XCTAssertEqual(res.highStressMinutes, 180)
-        XCTAssertTrue(res.sustainedHigh)
-        XCTAssertEqual(res.sustainedRun, 3)
+                       "23400:1.094451 25200:1.094451 27000:1.293378 28800:1.293378 30600:1.500000 "
+                       + "32400:1.500000 34200:1.706622 36000:1.706622 37800:1.905549 39600:1.905549")
+        XCTAssertEqual(res.highStressMinutes, 0)
+        XCTAssertFalse(res.sustainedHigh)
+        XCTAssertEqual(res.sustainedRun, 0)
         XCTAssertEqual(res.peak?.startTs, 39600)
     }
 
@@ -209,9 +212,10 @@ final class DaytimeStressTests: XCTestCase {
         XCTAssertTrue(r.hours.contains { $0.hour == 7 })
     }
 
-    func testRMSSDLowersStressDirectionMatchesDailyScore() {
-        // Same HR across hours; the hour with the LOWEST HRV (RMSSD) should read more
-        // stressed — the same directionality as the daily score (HRV down = stress).
+    func testDaytimeRMSSDDoesNotMoveDayRelativeScoreWhileGatedOff() {
+        // Same HR across hours, one hour with suppressed HRV. While `daytimeRMSSDScoringEnabled` is
+        // false, the default `.dayRelative` mode must ignore daytime RMSSD exactly as
+        // `.baselineRelative` does, so the tense-HRV hour scores like the others.
         var hr: [HRSample] = []
         var rr: [RRInterval] = []
         for h in [8, 9, 10, 11] { hr += hourHR(h, bpm: 65) }
@@ -223,7 +227,28 @@ final class DaytimeStressTests: XCTestCase {
         let r = DaytimeStress.analyze(hr: hr, rr: rr)
         let relaxed = r.scored.first { $0.hour == 9 }!.level!
         let tense = r.scored.first { $0.hour == 11 }!.level!
-        XCTAssertGreaterThan(tense, relaxed)
+        XCTAssertFalse(DaytimeStress.daytimeRMSSDScoringEnabled)
+        XCTAssertEqual(tense, relaxed, accuracy: 1e-9)
+    }
+
+    func testUneventfulDayDoesNotReadMostlyHigh() {
+        // Regression for the calm-quartile reference: ordinary hour-to-hour wobble (±5 bpm around
+        // 70) must not put most of the day in the HIGH band or trip the sustained-high nudge.
+        var hr: [HRSample] = []
+        let wobble = [70, 66, 73, 68, 75, 71, 65, 72, 69, 74, 67, 70, 73, 66, 71, 75]
+        for (i, bpm) in wobble.enumerated() { hr += hourHR(6 + i, bpm: bpm) }
+        let r = DaytimeStress.analyze(hr: hr, rr: [])
+        XCTAssertEqual(r.scored.filter { $0.level! >= DaytimeStress.highBandFloor }.count, 0)
+        XCTAssertFalse(r.sustainedHigh)
+    }
+
+    func testTenBpmOverTheMedianHourReadsHigh() {
+        // The fixed margin is the HIGH cutoff by construction: median 64, a +10 bpm hour lands on 2.0.
+        var hr: [HRSample] = []
+        for (h, bpm) in [(8, 64), (9, 64), (10, 64), (11, 74), (12, 64)] { hr += hourHR(h, bpm: bpm) }
+        let r = DaytimeStress.analyze(hr: hr, rr: [])
+        XCTAssertEqual(r.scored.first { $0.hour == 11 }!.level!, DaytimeStress.highBandFloor, accuracy: 1e-9)
+        XCTAssertEqual(r.scored.first { $0.hour == 9 }!.level!, 1.5, accuracy: 1e-9)
     }
 
     /// R-R for one hour with a controllable beat-to-beat jitter (drives RMSSD).

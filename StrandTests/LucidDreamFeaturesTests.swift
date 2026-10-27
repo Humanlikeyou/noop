@@ -144,6 +144,17 @@ final class LucidDreamFeaturesTests: XCTestCase {
         XCTAssertEqual(tally.wokeFromCue, 0)
     }
 
+    func testAnUnansweredNightDoesNotBlockTheNextMonitoredNight() {
+        let journal = LucidDreamJournal(directory: tempDir(), defaults: isolatedDefaults())
+        journal.touch(sessionID: "skipped", sleepOnset: 0, monitored: true, now: 100)
+        journal.touch(sessionID: "next", sleepOnset: 86_400, monitored: false, now: 86_400)
+        XCTAssertEqual(journal.night?.sessionID, "skipped", "early in the next night the old record stays")
+        journal.touch(sessionID: "next", sleepOnset: 86_400, monitored: true, now: 86_400 + 16_200)
+        journal.recordCue(sessionID: "next", at: 86_400 + 20_000)
+        XCTAssertEqual(journal.night?.sessionID, "next")
+        XCTAssertEqual(journal.night?.cueTimes, [86_400 + 20_000])
+    }
+
     func testUncuedNightRecordsNoWakeAnswer() {
         let journal = LucidDreamJournal(directory: tempDir(), defaults: isolatedDefaults())
         journal.touch(sessionID: "b", sleepOnset: 0, monitored: true, now: 0)

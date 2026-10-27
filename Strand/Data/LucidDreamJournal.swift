@@ -86,8 +86,9 @@ struct LucidDreamJournal {
         }
     }
 
-    /// Note activity for `sessionID`. A different session replaces the stored one only once the stored
-    /// night has been answered or never reached monitoring, so an unanswered night is not lost to a nap.
+    /// Note activity for `sessionID`. A different session replaces an unanswered monitored night only once
+    /// it reaches monitoring itself: a nap never gets that far, so the night is not lost to it, but the next
+    /// real night does, so one skipped check-in cannot block every later night's record.
     func touch(sessionID: String, sleepOnset: Int, monitored: Bool, now: Int) {
         if var current = night, current.sessionID == sessionID {
             current.monitored = current.monitored || monitored
@@ -95,7 +96,7 @@ struct LucidDreamJournal {
             night = current
             return
         }
-        if let current = night, current.monitored, !isAnswered(current.sessionID) { return }
+        if !monitored, let current = night, current.monitored, !isAnswered(current.sessionID) { return }
         night = LucidNightRecord(sessionID: sessionID, sleepOnset: sleepOnset, monitored: monitored,
                                  cueTimes: [], lastSeenAt: now)
     }

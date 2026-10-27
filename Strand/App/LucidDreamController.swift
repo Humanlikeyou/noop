@@ -276,8 +276,10 @@ final class LucidDreamController: ObservableObject {
            monitored != lastTouchMonitored || lastTouchAt.map({ now - $0 >= 60 }) ?? true {
             lastTouchAt = now
             lastTouchMonitored = monitored
+            // "Seen" is when the newest stage evidence was observed, not the clock: a finished session's
+            // stale evidence lingers all day and would otherwise hold the check-in back indefinitely.
             journal.touch(sessionID: evidence.sessionID, sleepOnset: evidence.sleepOnset,
-                          monitored: monitored, now: now)
+                          monitored: monitored, now: evidence.stageObservedAt)
         }
     }
 
